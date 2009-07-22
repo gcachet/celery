@@ -5,8 +5,12 @@ Asynchronous result types.
 """
 from celery.backends import default_backend
 from celery.datastructures import PositionQueue
-from celery.timer import TimeoutTimer
 from itertools import imap
+import threading
+
+
+class TimeoutError(Exception):
+    """The operation timed out."""
 
 
 class BaseAsyncResult(object):
@@ -27,6 +31,8 @@ class BaseAsyncResult(object):
         The task result backend used.
 
     """
+
+    TimeoutError = TimeoutError
 
     def __init__(self, task_id, backend):
         self.task_id = task_id
@@ -50,7 +56,7 @@ class BaseAsyncResult(object):
         :keyword timeout: How long to wait in seconds, before the
             operation times out.
 
-        :raises celery.timer.TimeoutError: if ``timeout`` is not ``None`` and
+        :raises TimeoutError: if ``timeout`` is not ``None`` and
             the result does not arrive within ``timeout`` seconds.
 
         If the remote call raised an exception then that
@@ -235,8 +241,8 @@ class TaskSetResult(object):
         :raises: The exception if any of the tasks raised an exception.
 
         """
-        results = dict([(subtask.task_id, AsyncResult(subtask.task_id))
-                            for subtask in self.subtasks])
+        results = dict((subtask.task_id, AsyncResult(subtask.task_id))
+                            for subtask in self.subtasks)
         while results:
             for task_id, pending_result in results.items():
                 if pending_result.status == "DONE":
@@ -253,7 +259,7 @@ class TaskSetResult(object):
         :keyword timeout: The time in seconds, how long
             it will wait for results, before the operation times out.
 
-        :raises celery.timer.TimeoutError: if ``timeout`` is not ``None``
+        :raises TimeoutError: if ``timeout`` is not ``None``
             and the operation takes longer than ``timeout`` seconds.
 
         If any of the tasks raises an exception, the exception
@@ -262,24 +268,67 @@ class TaskSetResult(object):
         :returns: list of return values for all tasks in the taskset.
 
         """
-        timeout_timer = TimeoutTimer(timeout)
+
+        def on_timeout():
+            raise TimeoutError("The operation timed out.")
+
+        timeout_timer = threading.Timer(timeout, on_timeout)
         results = PositionQueue(length=self.total)
 
-        while True:
-            for position, pending_result in enumerate(self.subtasks):
-                if pending_result.status == "DONE":
-                    results[position] = pending_result.result
-                elif pending_result.status == "FAILURE":
-                    raise pending_result.result
-            if results.full():
-                # Make list copy, so the returned type is not a position
-                # queue.
-                return list(results)
-
-            # This raises TimeoutError when timed out.
-            timeout_timer.tick()
+        timeout_timer.start()
+        try:
+            while True:
+                for position, pending_result in enumerate(self.subtasks):
+                    if pending_result.status == "DONE":
+                        results[position] = pending_result.result
+                    elif pending_result.status == "FAILURE":
+                        raise pending_result.result
+                if results.full():
+                    # Make list copy, so the returned type is not a position
+                    # queue.
+                    return list(results)
+        finally:
+            timeout_timer.cancel()
 
     @property
     def total(self):
         """The total number of tasks in the :class:`celery.task.TaskSet`."""
         return len(self.subtasks)
+
+
+class EagerResult(BaseAsyncResult):
+    """Result that we know has already been executed.  """
+    TimeoutError = TimeoutError
+
+    def __init__(self, task_id, ret_value, status):
+        self.task_id = task_id
+        self._result = ret_value
+        self._status = status
+
+    def is_done(self):
+        """Returns ``True`` if the task executed without failure."""
+        return self.status == "DONE"
+
+    def is_ready(self):
+        """Returns ``True`` if the task has been executed."""
+        return True
+
+    def wait(self, timeout=None):
+        """Wait until the task has been executed and return its result."""
+        if self.status == "DONE":
+            return self.result
+        elif self.status == "FAILURE":
+            raise self.result
+
+    @property
+    def result(self):
+        """The tasks return value"""
+        return self._result
+
+    @property
+    def status(self):
+        """The tasks status"""
+        return self._status
+
+    def __repr__(self):
+        return "<EagerResult: %s>" % self.task_id
