@@ -5,29 +5,38 @@ from Queue import Queue, Empty
 from datetime import datetime, timedelta
 
 from celery.worker.controllers import Mediator, PeriodicWorkController
-from celery.worker.controllers import InfinityThread
+from celery.worker.controllers import BackgroundThread
 
 
-class MyInfinityThread(InfinityThread):
+class MockTask(object):
+    task_id = 1234
+    task_name = "mocktask"
+
+    def __init__(self, value, **kwargs):
+        self.value = value
+
+
+class MyBackgroundThread(BackgroundThread):
 
     def on_iteration(self):
         import time
         time.sleep(1)
 
 
-class TestInfinityThread(unittest.TestCase):
+class TestBackgroundThread(unittest.TestCase):
 
     def test_on_iteration(self):
-        self.assertRaises(NotImplementedError, InfinityThread().on_iteration)
+        self.assertRaises(NotImplementedError,
+                BackgroundThread().on_iteration)
 
     def test_run(self):
-        t = MyInfinityThread()
+        t = MyBackgroundThread()
         t._shutdown.set()
         t.run()
         self.assertTrue(t._stopped.isSet())
 
     def test_start_stop(self):
-        t = MyInfinityThread()
+        t = MyBackgroundThread()
         t.start()
         self.assertFalse(t._shutdown.isSet())
         self.assertFalse(t._stopped.isSet())
@@ -54,10 +63,10 @@ class TestMediator(unittest.TestCase):
         got = {}
 
         def mycallback(value):
-            got["value"] = value
+            got["value"] = value.value
 
         m = Mediator(bucket_queue, mycallback)
-        bucket_queue.put("George Constanza")
+        bucket_queue.put(MockTask("George Constanza"))
 
         m.on_iteration()
 
@@ -73,16 +82,19 @@ class TestPeriodicWorkController(unittest.TestCase):
 
         m.process_hold_queue()
 
-        hold_queue.put(("task1", datetime.now() - timedelta(days=1)))
+        hold_queue.put((MockTask("task1"),
+                        datetime.now() - timedelta(days=1)))
 
         m.process_hold_queue()
         self.assertRaises(Empty, hold_queue.get_nowait)
-        self.assertEquals(bucket_queue.get_nowait(), "task1")
+        self.assertEquals(bucket_queue.get_nowait().value, "task1")
         tomorrow = datetime.now() + timedelta(days=1)
-        hold_queue.put(("task2", tomorrow))
+        hold_queue.put((MockTask("task2"), tomorrow))
         m.process_hold_queue()
         self.assertRaises(Empty, bucket_queue.get_nowait)
-        self.assertEquals(hold_queue.get_nowait(), ("task2", tomorrow))
+        value, eta = hold_queue.get_nowait()
+        self.assertEquals(value.value, "task2")
+        self.assertEquals(eta, tomorrow)
 
     def test_run_periodic_tasks(self):
         bucket_queue = Queue()

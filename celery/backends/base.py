@@ -181,7 +181,7 @@ class BaseBackend(object):
             elif status == "FAILURE":
                 raise self.get_result(task_id)
             # avoid hammering the CPU checking status.
-            time.sleep(sleep_inbetween) 
+            time.sleep(sleep_inbetween)
             time_elapsed += sleep_inbetween
             if timeout and time_elapsed >= timeout:
                 raise TimeoutError("The operation timed out.")
@@ -221,6 +221,7 @@ class KeyValueStoreBackend(BaseBackend):
             result = self.prepare_exception(result)
         meta = {"status": status, "result": result}
         self.set(self.get_cache_key_for_task(task_id), pickle.dumps(meta))
+        return result
 
     def get_status(self, task_id):
         """Get the status of a task."""
