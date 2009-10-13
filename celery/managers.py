@@ -1,6 +1,6 @@
 """celery.managers"""
 from django.db import models
-from django.db import connection
+from django.db import connection, transaction
 from celery.registry import tasks
 from celery.conf import TASK_RESULT_EXPIRES
 from datetime import datetime, timedelta
@@ -13,34 +13,34 @@ SERVER_DRIFT = timedelta(seconds=random.vonmisesvariate(1, 4))
 
 
 class TableLock(object):
-   """Base class for database table locks. Also works as a NOOP lock."""
-  
-   def __init__(self, table, type="read"):
+    """Base class for database table locks. Also works as a NOOP lock."""
+
+    def __init__(self, table, type="read"):
         self.table = table
         self.type = type
         self.cursor = None
 
-   def lock_table(self):
-       """Lock the table."""
-       pass
+    def lock_table(self):
+        """Lock the table."""
+        pass
 
-   def unlock_table(self):
-       """Release previously locked tables."""
-       pass
+    def unlock_table(self):
+        """Release previously locked tables."""
+        pass
 
-   @classmethod
-   def acquire(cls, table, type=None):
-       """Acquire table lock."""
-       lock = cls(table, type)
-       lock.lock_table()
-       return lock
+    @classmethod
+    def acquire(cls, table, type=None):
+        """Acquire table lock."""
+        lock = cls(table, type)
+        lock.lock_table()
+        return lock
 
-   def release(self):
-       """Release the lock."""
-       self.unlock_table()
-       if self.cursor:
-           self.cursor.close()
-           self.cursor = None
+    def release(self):
+        """Release the lock."""
+        self.unlock_table()
+        if self.cursor:
+            self.cursor.close()
+            self.cursor = None
 
 
 class MySQLTableLock(TableLock):
@@ -49,7 +49,8 @@ class MySQLTableLock(TableLock):
     def lock_table(self):
         """Lock MySQL table."""
         self.cursor = connection.cursor()
-        self.cursor.execute("LOCK TABLES %s %s" % (self.table, self.type.upper()))
+        self.cursor.execute("LOCK TABLES %s %s" % (
+            self.table, self.type.upper()))
 
     def unlock_table(self):
         """Unlock MySQL table."""
@@ -79,7 +80,8 @@ class TaskManager(models.Manager):
         """Delete all expired task results."""
         self.get_all_expired().delete()
 
-    def store_result(self, task_id, result, status):
+    def store_result(self, task_id, result, status, traceback=None,
+            exception_retry=True):
         """Store the result and status of a task.
 
         :param task_id: task id
@@ -91,14 +93,32 @@ class TaskManager(models.Manager):
             :meth:`celery.result.AsyncResult.get_status` for a list of
             possible status values.
 
+        :keyword traceback: The traceback at the point of exception (if the
+            task failed).
+
+        :keyword exception_retry: If True, we try a single retry with
+            transaction rollback on exception
         """
-        task, created = self.get_or_create(task_id=task_id, defaults={
-                                            "status": status,
-                                            "result": result})
-        if not created:
-            task.status = status
-            task.result = result
-            task.save()
+        try:
+            task, created = self.get_or_create(task_id=task_id, defaults={
+                                                "status": status,
+                                                "result": result,
+                                                "traceback": traceback})
+            if not created:
+                task.status = status
+                task.result = result
+                task.traceback = traceback
+                task.save()
+        except Exception, exc:
+            # depending on the database backend we can get various exceptions.
+            # for excample, psycopg2 raises an exception if some operation
+            # breaks transaction, and saving task result won't be possible
+            # until we rollback transaction
+            if exception_retry:
+                transaction.rollback_unless_managed()
+                self.store_result(task_id, result, status, traceback, False)
+            else:
+                raise
 
 
 class PeriodicTaskManager(models.Manager):

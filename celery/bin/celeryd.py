@@ -68,24 +68,19 @@ try:
     import resource
 except ImportError:
     CAN_DETACH = False
-sys.path.append(os.getcwd())
-django_project_dir = os.environ.get("DJANGO_PROJECT_DIR")
-if django_project_dir:
-    sys.path.append(django_project_dir)
 
-from django.conf import settings
+from celery.loaders import current_loader
+from celery.loaders import settings
 from celery import __version__
 from celery.supervisor import OFASupervisor
 from celery.log import emergency_error
 from celery.conf import LOG_LEVELS, DAEMON_LOG_FILE, DAEMON_LOG_LEVEL
 from celery.conf import DAEMON_CONCURRENCY, DAEMON_PID_FILE
-from celery.messaging import TaskConsumer
 from celery import conf
 from celery import discovery
 from celery.task import discard_all
 from celery.worker import WorkController
-from carrot.connection import DjangoAMQPConnection
-from celery.messaging import TaskConsumer, StatsConsumer
+import signal
 import multiprocessing
 import traceback
 import optparse
@@ -188,15 +183,24 @@ def run_worker(concurrency=DAEMON_CONCURRENCY, detach=False,
         statistics=None, **kwargs):
     """Starts the celery worker server."""
 
+    # set SIGCLD back to the default SIG_DFL (before python-daemon overrode
+    # it) lets the parent wait() for the terminated child process and stops
+    # the 'OSError: [Errno 10] No child processes' problem.
+
+    if hasattr(signal, "SIGCLD"): # Make sure the platform supports signals.
+        signal.signal(signal.SIGCLD, signal.SIG_DFL)
+
     print("Celery %s is starting." % __version__)
 
-    if statistics:
+    if statistics is not None:
         settings.CELERY_STATISTICS = statistics
 
     if not concurrency:
         concurrency = multiprocessing.cpu_count()
 
-    if settings.DATABASE_ENGINE == "sqlite3" and concurrency > 1:
+    if conf.CELERY_BACKEND == "database" \
+            and settings.DATABASE_ENGINE == "sqlite3" and \
+            concurrency > 1:
         import warnings
         warnings.warn("The sqlite3 database engine doesn't support "
                 "concurrency. We'll be using a single process only.",
@@ -218,9 +222,9 @@ def run_worker(concurrency=DAEMON_CONCURRENCY, detach=False,
     # Dump configuration to screen so we have some basic information
     # when users sends e-mails.
     print(STARTUP_INFO_FMT % {
-            "vhost": settings.AMQP_VHOST,
-            "host": settings.AMQP_SERVER,
-            "port": settings.AMQP_PORT,
+            "vhost": getattr(settings, "AMQP_VHOST", "(default)"),
+            "host": getattr(settings, "AMQP_SERVER", "(default)"),
+            "port": getattr(settings, "AMQP_PORT", "(default)"),
             "exchange": conf.AMQP_EXCHANGE,
             "exchange_type": conf.AMQP_EXCHANGE_TYPE,
             "consumer_queue": conf.AMQP_CONSUMER_QUEUE,
@@ -238,10 +242,13 @@ def run_worker(concurrency=DAEMON_CONCURRENCY, detach=False,
             raise RuntimeError(
                     "This operating system doesn't support detach. ")
         from daemon import DaemonContext
+        from celery.log import setup_logger, redirect_stdouts_to_logger
+
         # Since without stderr any errors will be silently suppressed,
         # we need to know that we have access to the logfile
         if logfile:
             open(logfile, "a").close()
+
         pidlock = acquire_pidlock(pidfile)
         if not umask:
             umask = 0
@@ -255,14 +262,23 @@ def run_worker(concurrency=DAEMON_CONCURRENCY, detach=False,
                                 uid=uid,
                                 gid=gid)
         context.open()
+        logger = setup_logger(loglevel, logfile)
+        redirect_stdouts_to_logger(logger, loglevel)
 
-    discovery.autodiscover()
+    # Run the worker init handler.
+    # (Usually imports task modules and such.)
+    current_loader.on_worker_init()
 
     def run_worker():
         worker = WorkController(concurrency=concurrency,
                                 loglevel=loglevel,
                                 logfile=logfile,
                                 is_detached=detach)
+
+        # Install signal handler that restarts celeryd on SIGHUP,
+        # (only on POSIX systems)
+        install_restart_signal_handler(worker)
+
         try:
             worker.start()
         except Exception, e:
@@ -278,6 +294,29 @@ def run_worker(concurrency=DAEMON_CONCURRENCY, detach=False,
         if detach:
             context.close()
         raise
+
+
+def install_restart_signal_handler(worker):
+    """Installs a signal handler that restarts the current program
+    when it receives the ``SIGHUP`` signal.
+    """
+    if not hasattr(signal, "SIGHUP"):
+        return  # platform is not POSIX
+
+    def restart_self(signum, frame):
+        """Signal handler restarting the current python program."""
+        worker.logger.info("Restarting celeryd (%s)" % (
+            " ".join(sys.argv)))
+        if worker.is_detached:
+            pid = os.fork()
+            if pid:
+                worker.stop()
+                sys.exit(0)
+        else:
+            worker.stop()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    signal.signal(signal.SIGHUP, restart_self)
 
 
 def parse_options(arguments):

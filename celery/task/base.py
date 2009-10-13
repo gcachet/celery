@@ -1,13 +1,14 @@
-from carrot.connection import DjangoAMQPConnection
-from celery.conf import AMQP_CONNECTION_TIMEOUT
+from carrot.connection import DjangoBrokerConnection
+from celery import conf
 from celery.messaging import TaskPublisher, TaskConsumer
 from celery.log import setup_logger
-from celery.result import TaskSetResult
+from celery.result import TaskSetResult, EagerResult
 from celery.execute import apply_async, delay_task, apply
 from celery.utils import gen_unique_id, get_full_cls_name
-from datetime import timedelta
 from celery.registry import tasks
 from celery.serialization import pickle
+from celery.exceptions import MaxRetriesExceededError, RetryTaskError
+from datetime import timedelta
 
 
 class Task(object):
@@ -15,6 +16,9 @@ class Task(object):
 
     All subclasses of :class:`Task` must define the :meth:`run` method,
     which is the actual method the ``celery`` daemon executes.
+
+    The :meth:`run` method can take use of the default keyword arguments,
+    as listed in the :meth:`run` documentation.
 
     The :meth:`run` method supports both positional, and keyword arguments.
 
@@ -33,6 +37,10 @@ class Task(object):
     .. attribute:: routing_key
 
         Override the global default ``routing_key`` for this task.
+
+    .. attribute:: exchange
+
+        Override the global default ``exchange`` for this task.
 
     .. attribute:: mandatory
 
@@ -53,6 +61,15 @@ class Task(object):
 
         The message priority. A number from ``0`` to ``9``.
 
+    .. attribute:: max_retries
+
+        Maximum number of retries before giving up.
+
+    .. attribute:: default_retry_delay
+
+        Defeault time in seconds before a retry of the task should be
+        executed. Default is a 1 minute delay.
+
     .. attribute:: ignore_result
 
         Don't store the status and return value. This means you can't
@@ -66,6 +83,14 @@ class Task(object):
         Disable all error e-mails for this task (only applicable if
         ``settings.SEND_CELERY_ERROR_EMAILS`` is on.)
 
+    .. attribute:: serializer
+
+        A string identifying the default serialization
+        method to use. Defaults to the ``CELERY_TASK_SERIALIZER`` setting.
+        Can be ``pickle`` ``json``, ``yaml``, or any custom serialization
+        methods that have been registered with
+        :mod:`carrot.serialization.registry`.
+
     :raises NotImplementedError: if the :attr:`name` attribute is not set.
 
     The resulting class is callable, which if called will apply the
@@ -77,7 +102,6 @@ class Task(object):
 
         >>> from celery.task import tasks, Task
         >>> class MyTask(Task):
-        ...     name = "mytask"
         ...
         ...     def run(self, some_arg=None, **kwargs):
         ...         logger = self.get_logger(**kwargs)
@@ -104,12 +128,18 @@ class Task(object):
     """
     name = None
     type = "regular"
+    exchange = None
     routing_key = None
     immediate = False
     mandatory = False
     priority = None
     ignore_result = False
     disable_error_emails = False
+    max_retries = 3
+    default_retry_delay = 3 * 60
+    serializer = conf.TASK_SERIALIZER
+
+    MaxRetriesExceededError = MaxRetriesExceededError
 
     def __init__(self):
         if not self.__class__.name:
@@ -119,12 +149,58 @@ class Task(object):
         return self.run(*args, **kwargs)
 
     def run(self, *args, **kwargs):
-        """*REQUIRED* The actual task.
+        """The body of the task executed by the worker.
 
-        All subclasses of :class:`Task` must define the run method.
+        The following standard keyword arguments are reserved and is passed
+        by the worker if the function/method supports them:
 
-        :raises NotImplementedError: by default, so you have to override
-            this method in your subclass.
+            * task_id
+
+                Unique id of the currently executing task.
+
+            * task_name
+
+                Name of the currently executing task (same as :attr:`name`)
+
+            * task_retries
+
+                How many times the current task has been retried
+                (an integer starting at ``0``).
+
+            * logfile
+
+                Name of the worker log file.
+
+            * loglevel
+
+                The current loglevel, an integer mapping to one of the
+                following values: ``logging.DEBUG``, ``logging.INFO``,
+                ``logging.ERROR``, ``logging.CRITICAL``, ``logging.WARNING``,
+                ``logging.FATAL``.
+
+        Additional standard keyword arguments may be added in the future.
+        To take these default arguments, the task can either list the ones
+        it wants explicitly or just take an arbitrary list of keyword
+        arguments (\*\*kwargs).
+
+        Example using an explicit list of default arguments to take:
+
+        .. code-block:: python
+
+            def run(self, x, y, logfile=None, loglevel=None):
+                self.get_logger(loglevel=loglevel, logfile=logfile)
+                return x * y
+
+
+        Example taking all default keyword arguments, and any extra arguments
+        passed on by the caller:
+
+        .. code-block:: python
+
+            def run(self, x, y, **kwargs): # CORRECT!
+                logger = self.get_logger(**kwargs)
+                adjust = kwargs.get("adjust", 0)
+                return x * y - adjust
 
         """
         raise NotImplementedError("Tasks must define a run method.")
@@ -135,9 +211,11 @@ class Task(object):
         See :func:`celery.log.setup_logger`.
 
         """
-        return setup_logger(**kwargs)
+        logfile = kwargs.get("logfile")
+        loglevel = kwargs.get("loglevel")
+        return setup_logger(loglevel=loglevel, logfile=logfile)
 
-    def get_publisher(self):
+    def get_publisher(self, connect_timeout=conf.AMQP_CONNECTION_TIMEOUT):
         """Get a celery task message publisher.
 
         :rtype: :class:`celery.messaging.TaskPublisher`.
@@ -150,10 +228,13 @@ class Task(object):
             >>> publisher.connection.close()
 
         """
-        return TaskPublisher(connection=DjangoAMQPConnection(
-                                connect_timeout=AMQP_CONNECTION_TIMEOUT))
 
-    def get_consumer(self):
+        connection = DjangoBrokerConnection(connect_timeout=connect_timeout)
+        return TaskPublisher(connection=connection,
+                             exchange=self.exchange,
+                             routing_key=self.routing_key)
+
+    def get_consumer(self, connect_timeout=conf.AMQP_CONNECTION_TIMEOUT):
         """Get a celery task message consumer.
 
         :rtype: :class:`celery.messaging.TaskConsumer`.
@@ -166,8 +247,9 @@ class Task(object):
             >>> consumer.connection.close()
 
         """
-        return TaskConsumer(connection=DjangoAMQPConnection(
-                                connect_timeout=AMQP_CONNECTION_TIMEOUT))
+        connection = DjangoBrokerConnection(connect_timeout=connect_timeout)
+        return TaskConsumer(connection=connection, exchange=self.exchange,
+                            routing_key=self.routing_key)
 
     @classmethod
     def delay(cls, *args, **kwargs):
@@ -189,15 +271,123 @@ class Task(object):
         """Delay this task for execution by the ``celery`` daemon(s).
 
         :param args: positional arguments passed on to the task.
-
         :param kwargs: keyword arguments passed on to the task.
+        :keyword \*\*options: Any keyword arguments to pass on to
+            :func:`celery.execute.apply_async`.
+
+        See :func:`celery.execute.apply_async` for more information.
 
         :rtype: :class:`celery.result.AsyncResult`
 
-        See :func:`celery.execute.apply_async`.
 
         """
         return apply_async(cls, args, kwargs, **options)
+
+    def retry(self, args, kwargs, exc=None, throw=True, **options):
+        """Retry the task.
+
+        :param args: Positional arguments to retry with.
+        :param kwargs: Keyword arguments to retry with.
+        :keyword exc: Optional exception to raise instead of
+            :exc:`MaxRestartsExceededError` when the max restart limit has
+            been exceeded.
+        :keyword throw: Do not raise the
+            :exc:`celery.exceptions.RetryTaskError` exception,
+            that tells the worker that the task is to be retried.
+        :keyword countdown: Time in seconds to delay the retry for.
+        :keyword eta: Explicit time and date to run the retry at (must be a
+            :class:`datetime.datetime` instance).
+        :keyword \*\*options: Any extra options to pass on to
+            meth:`apply_async`. See :func:`celery.execute.apply_async`.
+
+        :raises celery.exceptions.RetryTaskError: To tell the worker that the
+            task has been re-sent for retry. This always happens except if
+            the ``throw`` keyword argument has been explicitly set
+            to ``False``.
+
+        Example
+
+            >>> class TwitterPostStatusTask(Task):
+            ...
+            ...     def run(self, username, password, message, **kwargs):
+            ...         twitter = Twitter(username, password)
+            ...         try:
+            ...             twitter.post_status(message)
+            ...         except twitter.FailWhale, exc:
+            ...             # Retry in 5 minutes.
+            ...             self.retry([username, password, message], kwargs,
+            ...                        countdown=60 * 5, exc=exc)
+
+        """
+        options["retries"] = kwargs.pop("task_retries", 0) + 1
+        options["task_id"] = kwargs.pop("task_id", None)
+        options["countdown"] = options.get("countdown",
+                                           self.default_retry_delay)
+        max_exc = exc or self.MaxRetriesExceededError(
+                "Can't retry %s[%s] args:%s kwargs:%s" % (
+                    self.name, options["task_id"], args, kwargs))
+        if options["retries"] > self.max_retries:
+            raise max_exc
+
+        # If task was executed eagerly using apply(),
+        # then the retry must also be executed eagerly.
+        if kwargs.get("task_is_eager", False):
+            result = self.apply(args=args, kwargs=kwargs, **options)
+            if isinstance(result, EagerResult):
+                # get() propogates any exceptions.
+                return result.get()
+            return result
+
+        self.apply_async(args=args, kwargs=kwargs, **options)
+
+        if throw:
+            message = "Retry in %d seconds." % options["countdown"]
+            raise RetryTaskError(message, exc)
+
+    def on_retry(self, exc, task_id, args, kwargs):
+        """Retry handler.
+
+        This is run by the worker when the task is to be retried.
+
+        :param exc: The exception sent to :meth:`retry`.
+        :param task_id: Unique id of the retried task.
+        :param args: Original arguments for the retried task.
+        :param kwargs: Original keyword arguments for the retried task.
+
+        The return value of this handler is ignored.
+
+        """
+        pass
+
+    def on_failure(self, exc, task_id, args, kwargs):
+        """Error handler.
+
+        This is run by the worker when the task fails.
+
+        :param exc: The exception raised by the task.
+        :param task_id: Unique id of the failed task.
+        :param args: Original arguments for the task that failed.
+        :param kwargs: Original keyword arguments for the task that failed.
+
+        The return value of this handler is ignored.
+
+        """
+        pass
+
+    def on_success(self, retval, task_id, args, kwargs):
+        """Success handler.
+
+        This is run by the worker when the task executed successfully.
+
+        :param retval: The return value of the task.
+        :param task_id: Unique id of the executed task.
+        :param args: Original arguments for the executed task.
+        :param kwargs: Original keyword arguments for the executed task.
+
+        The return value of this handler is ignored.
+
+        """
+        pass
 
     @classmethod
     def apply(cls, args=None, kwargs=None, **options):
@@ -304,7 +494,7 @@ class TaskSet(object):
         self.arguments = args
         self.total = len(args)
 
-    def run(self, connect_timeout=AMQP_CONNECTION_TIMEOUT):
+    def run(self, connect_timeout=conf.AMQP_CONNECTION_TIMEOUT):
         """Run all tasks in the taskset.
 
         :returns: A :class:`celery.result.TaskSetResult` instance.
@@ -342,8 +532,9 @@ class TaskSet(object):
                             for args, kwargs in self.arguments]
             return TaskSetResult(taskset_id, subtasks)
 
-        conn = DjangoAMQPConnection(connect_timeout=connect_timeout)
-        publisher = TaskPublisher(connection=conn)
+        conn = DjangoBrokerConnection(connect_timeout=connect_timeout)
+        publisher = TaskPublisher(connection=conn,
+                                  exchange=self.task.exchange)
         subtasks = [apply_async(self.task, args, kwargs,
                                 taskset_id=taskset_id, publisher=publisher)
                         for args, kwargs in self.arguments]
@@ -433,7 +624,9 @@ class PeriodicTask(Task):
                     "Periodic tasks must have a run_every attribute")
 
         # If run_every is a integer, convert it to timedelta seconds.
-        if isinstance(self.run_every, int):
-            self.run_every = timedelta(seconds=self.run_every)
+        # Operate on the original class attribute so anyone accessing
+        # it directly gets the right value.
+        if isinstance(self.__class__.run_every, int):
+            self.__class__.run_every = timedelta(seconds=self.run_every)
 
         super(PeriodicTask, self).__init__()

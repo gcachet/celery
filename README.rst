@@ -1,13 +1,25 @@
-============================================
-celery - Distributed Task Queue for Django.
-============================================
+=================================
+ celery - Distributed Task Queue
+=================================
 
-:Version: 0.3.20
+:Version: 0.8.0
 
 Introduction
 ============
 
-``celery`` is a distributed task queue framework for Django.
+Celery is a distributed task queue.
+
+It was first created for Django, but is now usable from Python.
+It can also operate with other languages via HTTP+JSON.
+
+This introduction is written for someone who wants to use
+Celery from within a Django project. For information about using it from
+pure Python see `Can I use Celery without Django?`_, for calling out to other
+languages see `Executing tasks on a remote web server`_.
+
+.. _`Can I use Celery without Django?`: http://bit.ly/WPa6n
+
+.. _`Executing tasks on a remote web server`: http://bit.ly/CgXSc
 
 It is used for executing tasks *asynchronously*, routed to one or more
 worker servers, running concurrently using multiprocessing.
@@ -39,8 +51,9 @@ The result of the task can be stored for later retrieval (called its
 Features
 ========
 
-    * Uses AMQP messaging (RabbitMQ, ZeroMQ) to route tasks to the
-      worker servers.
+    * Uses AMQP messaging (RabbitMQ, ZeroMQ, Qpid) to route tasks to the
+      worker servers. Experimental support for STOMP (ActiveMQ) is also 
+      available.
 
     * You can run as many worker servers as you want, and still
       be *guaranteed that the task is only executed once.*
@@ -54,13 +67,21 @@ Features
 
     * When a task has been executed, the return value can be stored using
       either a MySQL/Oracle/PostgreSQL/SQLite database, Memcached,
-      or Tokyo Tyrant back-end.
+      `MongoDB`_ or `Tokyo Tyrant`_ back-end. For high-performance you can
+      also use AMQP messages to publish results.
 
     * If the task raises an exception, the exception instance is stored,
       instead of the return value.
 
     * All tasks has a Universally Unique Identifier (UUID), which is the
       task id, used for querying task status and return values.
+
+    * Tasks can be retried if they fail, with a configurable maximum number
+      of retries.
+
+    * Tasks can be configured to run at a specific time and date in the
+      future (ETA) or you can set a countdown in seconds for when the
+      task should be executed.
 
     * Supports *task-sets*, which is a task consisting of several sub-tasks.
       You can find out how many, or if all of the sub-tasks has been executed.
@@ -77,6 +98,15 @@ Features
     * The worker can collect statistics, like, how many tasks has been
       executed by type, and the time it took to process them. Very useful
       for monitoring and profiling.
+
+    * Pool workers are supervised, so if for some reason a worker crashes
+        it is automatically replaced by a new worker.
+
+    * Can be configured to send e-mails to the administrators when a task
+      fails.
+
+.. _`MongoDB`: http://www.mongodb.org/
+.. _`Tokyo Tyrant`: http://tokyocabinet.sourceforge.net/
 
 API Reference Documentation
 ===========================
@@ -116,10 +146,9 @@ You can install it by doing the following,::
 Using the development version
 ------------------------------
 
-
 You can clone the repository by doing the following::
 
-    $ git clone git://github.com/ask/celery.git celery
+    $ git clone git://github.com/ask/celery.git
 
 
 Usage
@@ -240,12 +269,39 @@ and return a value:
     >>> from celery.task import Task
     >>> from celery.registry import tasks
     >>> class MyTask(Task):
-    ...     name = "myapp.mytask"
     ...     def run(self, some_arg, **kwargs):
     ...         logger = self.get_logger(**kwargs)
     ...         logger.info("Did something: %s" % some_arg)
     ...         return 42
     >>> tasks.register(MyTask)
+
+As you can see the worker is sending some keyword arguments to this task,
+this is the default keyword arguments. A task can choose not to take these,
+or only list the ones it want (the worker will do the right thing).
+The current default keyword arguments are:
+
+    * logfile
+
+        The currently used log file, can be passed on to ``self.get_logger``
+        to gain access to the workers log file via a ``logger.Logging``
+        instance.
+
+    * loglevel
+
+        The current loglevel used.
+
+    * task_id
+
+        The unique id of the executing task.
+
+    * task_name
+
+        Name of the executing task.
+
+    * task_retries
+
+        How many times the current task has been retried.
+        (an integer starting a ``0``).
 
 Now if we want to execute this task, we can use the ``delay`` method of the
 task class (this is a handy shortcut to the ``apply_async`` method which gives
@@ -257,6 +313,10 @@ you greater control of the task execution).
 At this point, the task has been sent to the message broker. The message
 broker will hold on to the task until a celery worker server has successfully
 picked it up.
+
+*Note* If everything is just hanging when you execute ``delay``, please check
+that RabbitMQ is running, and that the user/password has access to the virtual
+host you configured earlier.
 
 Right now we have to check the celery worker logfiles to know what happened with
 the task. This is because we didn't keep the ``AsyncResult`` object returned
@@ -301,7 +361,6 @@ Here's an example of a periodic task:
     >>> from celery.registry import tasks
     >>> from datetime import timedelta
     >>> class MyPeriodicTask(PeriodicTask):
-    ...     name = "foo.my-periodic-task"
     ...     run_every = timedelta(seconds=30)
     ...
     ...     def run(self, **kwargs):

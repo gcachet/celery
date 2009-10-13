@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import unittest
-from celery.worker.job import jail
+from celery.execute import ExecuteWrapper
 from celery.worker.job import TaskWrapper
 from celery.datastructures import ExceptionInfo
 from celery.models import TaskMeta
@@ -16,6 +16,11 @@ import simplejson
 import logging
 
 scratch = {"ACK": False}
+some_kwargs_scratchpad = {}
+
+
+def jail(task_id, task_name, fun, args, kwargs):
+    return ExecuteWrapper(fun, task_id, task_name, args, kwargs)()
 
 
 def on_ack():
@@ -25,6 +30,17 @@ def on_ack():
 def mytask(i, **kwargs):
     return i ** i
 tasks.register(mytask, name="cu.mytask")
+
+
+def mytask_no_kwargs(i):
+    return i ** i
+tasks.register(mytask_no_kwargs, name="mytask_no_kwargs")
+
+
+def mytask_some_kwargs(i, logfile):
+    some_kwargs_scratchpad["logfile"] = logfile
+    return i ** i
+tasks.register(mytask_some_kwargs, name="mytask_some_kwargs")
 
 
 def mytask_raising(i, **kwargs):
@@ -174,6 +190,25 @@ class TestTaskWrapper(unittest.TestCase):
         self.assertEquals(meta.result, 256)
         self.assertEquals(meta.status, "DONE")
 
+    def test_execute_success_no_kwargs(self):
+        tid = gen_unique_id()
+        tw = TaskWrapper("cu.mytask_no_kwargs", tid, mytask_no_kwargs,
+                         [4], {})
+        self.assertEquals(tw.execute(), 256)
+        meta = TaskMeta.objects.get(task_id=tid)
+        self.assertEquals(meta.result, 256)
+        self.assertEquals(meta.status, "DONE")
+
+    def test_execute_success_some_kwargs(self):
+        tid = gen_unique_id()
+        tw = TaskWrapper("cu.mytask_some_kwargs", tid, mytask_some_kwargs,
+                         [4], {})
+        self.assertEquals(tw.execute(logfile="foobaz.log"), 256)
+        meta = TaskMeta.objects.get(task_id=tid)
+        self.assertEquals(some_kwargs_scratchpad.get("logfile"), "foobaz.log")
+        self.assertEquals(meta.result, 256)
+        self.assertEquals(meta.status, "DONE")
+
     def test_execute_ack(self):
         tid = gen_unique_id()
         tw = TaskWrapper("cu.mytask", tid, mytask, [4], {"f": "x"},
@@ -210,6 +245,7 @@ class TestTaskWrapper(unittest.TestCase):
             "logfile": "some_logfile",
             "loglevel": 10,
             "task_id": tw.task_id,
+            "task_retries": 0,
             "task_name": tw.task_name})
 
     def test_on_failure(self):
@@ -227,7 +263,7 @@ class TestTaskWrapper(unittest.TestCase):
         from celery import conf
         conf.SEND_CELERY_TASK_ERROR_EMAILS = True
 
-        tw.on_failure(exc_info, {"task_id": tid, "task_name": "cu.mytask"})
+        tw.on_failure(exc_info)
         logvalue = logfh.getvalue()
         self.assertTrue("cu.mytask" in logvalue)
         self.assertTrue(tid in logvalue)

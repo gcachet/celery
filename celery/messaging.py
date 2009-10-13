@@ -3,15 +3,17 @@
 Sending and Receiving Messages
 
 """
-from carrot.messaging import Publisher, Consumer
+from carrot.messaging import Publisher, Consumer, ConsumerSet
 from celery import conf
+from celery import signals
 from celery.utils import gen_unique_id
 from celery.utils import mitemgetter
 from celery.serialization import pickle
 
 
 MSG_OPTIONS = ("mandatory", "priority",
-               "immediate", "routing_key")
+               "immediate", "routing_key",
+               "serializer")
 
 get_msg_options = mitemgetter(*MSG_OPTIONS)
 
@@ -23,7 +25,7 @@ class TaskPublisher(Publisher):
     exchange = conf.AMQP_EXCHANGE
     exchange_type = conf.AMQP_EXCHANGE_TYPE
     routing_key = conf.AMQP_PUBLISHER_ROUTING_KEY
-    serializer = "pickle"
+    serializer = conf.TASK_SERIALIZER
     encoder = pickle.dumps
 
     def delay_task(self, task_name, task_args, task_kwargs, **kwargs):
@@ -37,11 +39,6 @@ class TaskPublisher(Publisher):
         return self._delay_task(task_name=task_name, part_of_set=taskset_id,
                                 task_args=task_args, task_kwargs=task_kwargs,
                                 **kwargs)
-
-    def retry_task(self, task_name, task_id, delivery_info, **kwargs):
-        kwargs["routing_key"] = delivery_info.get("routing_key")
-        kwargs["retries"] = kwargs.get("retries", 0) + 1
-        self._delay_task(task_name, task_id, **kwargs)
 
     def _delay_task(self, task_name, task_id=None, part_of_set=None,
             task_args=None, task_kwargs=None, **kwargs):
@@ -57,11 +54,18 @@ class TaskPublisher(Publisher):
             "retries": kwargs.get("retries", 0),
             "eta": kwargs.get("eta"),
         }
+
         if part_of_set:
             message_data["taskset"] = part_of_set
 
         self.send(message_data, **extract_msg_options(kwargs))
+        signals.task_sent.send(sender=task_name, **message_data)
+
         return task_id
+
+
+def get_consumer_set(connection, queues=conf.AMQP_CONSUMER_QUEUES, **options):
+    return ConsumerSet(connection, from_dict=queues, **options)
 
 
 class TaskConsumer(Consumer):

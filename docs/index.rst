@@ -2,16 +2,18 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-================================
- Celery - The Django Task Queue
-================================
+=================================
+ Celery - Distributed Task Queue
+=================================
 
 Contents:
 
 .. toctree::
-    :maxdepth: 3
+    :maxdepth: 2
 
     introduction
+    configuration
+    cookbook/index
     tutorials/index
     faq
     reference/index

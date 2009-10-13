@@ -3,6 +3,7 @@
 import codecs
 import sys
 import os
+import platform
 
 try:
     from setuptools import setup, find_packages, Command
@@ -42,8 +43,17 @@ class RunTests(Command):
 
 install_requires = ["django-unittest-depth",
                     "anyjson",
-                    "carrot>=0.5.0",
-                    "python-daemon"]
+                    "carrot>=0.6.0"]
+
+# python-daemon doesn't run on windows, so check current platform
+if platform.system() == "Windows":
+    print("""
+    ***WARNING***
+    I see you are using windows. You will not be able to run celery
+    in daemon mode with the --detach parameter.""")
+else:
+    install_requires.append("python-daemon>=1.4.8")
+
 py_version_info = sys.version_info
 py_major_version = py_version_info[0]
 py_minor_version = py_version_info[1]
@@ -65,8 +75,9 @@ setup(
     author_email=celery.__contact__,
     url=celery.__homepage__,
     platforms=["any"],
+    license="BSD",
     packages=find_packages(exclude=['ez_setup']),
-    scripts=["bin/celeryd"],
+    scripts=["bin/celeryd", "bin/celeryinit"],
     zip_safe=False,
     install_requires=install_requires,
     extra_requires={

@@ -6,7 +6,8 @@ Worker Controller Threads
 from celery.backends import default_periodic_status_backend
 from Queue import Empty as QueueEmpty
 from datetime import datetime
-from multiprocessing import get_logger
+from celery.log import get_default_logger
+import traceback
 import threading
 import time
 
@@ -83,14 +84,14 @@ class Mediator(BackgroundThread):
         self.callback = callback
 
     def on_iteration(self):
-        logger = get_logger()
+        """Get tasks from bucket queue and apply the task callback."""
+        logger = get_default_logger()
         try:
             logger.debug("Mediator: Trying to get message from bucket_queue")
             # This blocks until there's a message in the queue.
             task = self.bucket_queue.get(timeout=1)
         except QueueEmpty:
             logger.debug("Mediator: Bucket queue is empty.")
-            pass
         else:
             logger.debug("Mediator: Running callback for task: %s[%s]" % (
                 task.task_name, task.task_id))
@@ -118,16 +119,22 @@ class PeriodicWorkController(BackgroundThread):
         default_periodic_status_backend.init_periodic_tasks()
 
     def on_iteration(self):
-        logger = get_logger()
+        """Run periodic tasks and process the hold queue."""
+        logger = get_default_logger()
         logger.debug("PeriodicWorkController: Running periodic tasks...")
-        self.run_periodic_tasks()
+        try:
+            self.run_periodic_tasks()
+        except Exception, exc:
+            logger.error(
+                "PeriodicWorkController got exception: %s\n%s" % (
+                    exc, traceback.format_exc()))
         logger.debug("PeriodicWorkController: Processing hold queue...")
         self.process_hold_queue()
         logger.debug("PeriodicWorkController: Going to sleep...")
         time.sleep(1)
 
     def run_periodic_tasks(self):
-        logger = get_logger()
+        logger = get_default_logger()
         applied = default_periodic_status_backend.run_periodic_tasks()
         for task, task_id in applied:
             logger.debug(
@@ -137,21 +144,23 @@ class PeriodicWorkController(BackgroundThread):
     def process_hold_queue(self):
         """Finds paused tasks that are ready for execution and move
         them to the :attr:`bucket_queue`."""
-        logger = get_logger()
+        logger = get_default_logger()
         try:
             logger.debug(
                 "PeriodicWorkController: Getting next task from hold queue..")
-            task, eta = self.hold_queue.get_nowait()
+            task, eta, on_accept = self.hold_queue.get_nowait()
         except QueueEmpty:
             logger.debug("PeriodicWorkController: Hold queue is empty")
             return
+
         if datetime.now() >= eta:
             logger.debug(
                 "PeriodicWorkController: Time to run %s[%s] (%s)..." % (
                     task.task_name, task.task_id, eta))
+            on_accept() # Run the accept task callback.
             self.bucket_queue.put(task)
         else:
             logger.debug(
                 "PeriodicWorkController: ETA not ready for %s[%s] (%s)..." % (
                     task.task_name, task.task_id, eta))
-            self.hold_queue.put((task, eta))
+            self.hold_queue.put((task, eta, on_accept))

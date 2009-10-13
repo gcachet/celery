@@ -3,7 +3,7 @@
 Working with tasks and task sets.
 
 """
-from carrot.connection import DjangoAMQPConnection
+from carrot.connection import DjangoBrokerConnection
 from celery.messaging import TaskConsumer
 from celery.conf import AMQP_CONNECTION_TIMEOUT
 from celery.registry import tasks
@@ -14,6 +14,7 @@ from celery.task.base import AsynchronousMapTask
 from celery.task.builtins import DeleteExpiredTaskMetaTask, PingTask
 from celery.execute import apply_async, delay_task
 from celery.serialization import pickle
+from celery.task.rest import RESTProxyTask
 
 
 def discard_all(connect_timeout=AMQP_CONNECTION_TIMEOUT):
@@ -27,7 +28,7 @@ def discard_all(connect_timeout=AMQP_CONNECTION_TIMEOUT):
     :rtype: int
 
     """
-    amqp_connection = DjangoAMQPConnection(connect_timeout=connect_timeout)
+    amqp_connection = DjangoBrokerConnection(connect_timeout=connect_timeout)
     consumer = TaskConsumer(connection=amqp_connection)
     discarded_count = consumer.discard_all()
     amqp_connection.close()
@@ -48,7 +49,7 @@ def dmap(func, args, timeout=None):
 
     Example
 
-        >>> from celery.task import map
+        >>> from celery.task import dmap
         >>> import operator
         >>> dmap(operator.add, [[2, 2], [4, 4], [8, 8]])
         [4, 8, 16]

@@ -3,10 +3,12 @@
 Django Models.
 
 """
+import django
 from django.db import models
 from celery.registry import tasks
 from celery.managers import TaskManager, PeriodicTaskManager
 from celery.fields import PickledObjectField
+from celery import conf
 from django.utils.translation import ugettext_lazy as _
 from datetime import datetime
 
@@ -26,6 +28,7 @@ class TaskMeta(models.Model):
             default=TASK_STATUS_PENDING, choices=TASK_STATUSES_CHOICES)
     result = PickledObjectField()
     date_done = models.DateTimeField(_(u"done at"), auto_now=True)
+    traceback = models.TextField(_(u"traceback"), blank=True, null=True)
 
     objects = TaskManager()
 
@@ -68,3 +71,11 @@ class PeriodicTaskMeta(models.Model):
     def task(self):
         """The entry registered in the task registry for this task."""
         return tasks[self.name]
+
+
+if (django.VERSION[0], django.VERSION[1]) >= (1, 1):
+    # keep models away from syncdb/reset if database backend is not being used.
+    if conf.CELERY_BACKEND != 'database':
+        TaskMeta._meta.managed = False
+    if conf.CELERY_PERIODIC_STATUS_BACKEND != 'database':
+        PeriodicTaskMeta._meta.managed = False

@@ -2,7 +2,138 @@
 Change history
 ==============
 
-0.6.0 [2009-07-29 01:59 P.M CET]
+0.8.0 [2009-09-22 03:06 P.M CET]
+--------------------------------
+
+**BACKWARD INCOMPATIBLE CHANGES**
+
+* Add traceback to result value on failure.
+	**NOTE** If you use the database backend you have to re-create the
+	database table ``celery_taskmeta``.
+	
+	Contact the mailinglist or IRC channel listed in README for help
+	doing this.
+
+* Database tables are now only created if the database backend is used,
+	so if you change back to the database backend at some point,
+	be sure to initialize tables (django: ``syncdb``, python: ``celeryinit``).
+	(Note: This is only the case when using Django 1.1 or higher)
+
+* Now depends on ``carrot`` version 0.6.0.
+
+* Now depends on python-daemon 1.4.8
+
+**IMPORTANT CHANGES**
+
+* Celery can now be used in pure Python (outside of a Django project).
+	This means celery is no longer Django specific.
+	
+	For more information see the FAQ entry
+	`Can I use celery without Django?`_.
+
+.. _`Can I use celery without Django?`:
+	http://ask.github.com/celery/faq.html#can-i-use-celery-without-django
+
+* Celery now supports task retries.
+
+	See `Cookbook: Retrying Tasks`_ for more information.
+
+.. _`Cookbook: Retrying Tasks`:
+	http://ask.github.com/celery/cookbook/task-retries.html
+
+* We now have an AMQP result store backend.
+
+	It uses messages to publish task return value and status. And it's
+	incredibly fast!
+
+	See http://github.com/ask/celery/issues/closed#issue/6 for more info!
+
+* AMQP QoS (prefetch count) implemented:
+	This to not receive more messages than we can handle.
+
+* Now redirects stdout/stderr to the celeryd logfile when detached 
+
+* Now uses ``inspect.getargspec`` to only pass default arguments
+	the task supports.
+
+* Add Task.on_success, .on_retry, .on_failure handlers
+	See :meth:`celery.task.base.Task.on_success`,
+	    :meth:`celery.task.base.Task.on_retry`,
+	    	:meth:`celery.task.base.Task.on_failure`,
+
+* ``celery.utils.gen_unique_id``: Workaround for
+	http://bugs.python.org/issue4607
+
+* You can now customize what happens at worker start, at process init, etc
+	by creating your own loaders. (see :mod:`celery.loaders.default`,
+	:mod:`celery.loaders.djangoapp`, :mod:`celery.loaders`.)
+
+* Support for multiple AMQP exchanges and queues.
+
+	This feature misses documentation and tests, so anyone interested 
+	is encouraged to improve this situation.
+
+* celeryd now survives a restart of the AMQP server!
+
+  Automatically re-establish AMQP broker connection if it's lost.
+
+  New settings:
+
+    * AMQP_CONNECTION_RETRY
+        Set to ``True`` to enable connection retries.
+
+    * AMQP_CONNECTION_MAX_RETRIES.
+        Maximum number of restarts before we give up. Default: ``100``.
+
+**NEWS**
+
+*  Fix an incompatibility between python-daemon and multiprocessing,
+	which resulted in the ``[Errno 10] No child processes`` problem when
+	detaching.
+
+* Fixed a possible DjangoUnicodeDecodeError being raised when saving pickled
+	data to Django's memcached cache backend.
+
+* Better Windows compatibility.
+
+* New version of the pickled field (taken from
+	http://www.djangosnippets.org/snippets/513/)
+
+* New signals introduced: ``task_sent``, ``task_prerun`` and
+	``task_postrun``, see :mod:`celery.signals` for more information.
+
+* ``TaskSetResult.join`` caused ``TypeError`` when ``timeout=None``.
+	Thanks Jerzy Kozera.  Closes #31
+
+* ``views.apply`` should return ``HttpResponse`` instance.
+	Thanks to Jerzy Kozera. Closes #32
+
+* ``PeriodicTask``: Save conversion of ``run_every`` from ``int``
+	to ``timedelta`` to the class attribute instead of on the instance.
+
+* Exceptions has been moved to ``celery.exceptions``, but are still
+	available in the previous module.
+
+* Try to rollback transaction and retry saving result if an error happens
+	while setting task status with the database backend.
+
+* jail() refactored into :class:`celery.execute.ExecuteWrapper`.
+
+* ``views.apply`` now correctly sets mimetype to "application/json"
+
+* ``views.task_status`` now returns exception if status is RETRY
+
+* ``views.task_status`` now returns traceback if status is "FAILURE"
+	or "RETRY"
+
+* Documented default task arguments.
+
+* Add a sensible __repr__ to ExceptionInfo for easier debugging
+
+* Fix documentation typo ``.. import map`` -> ``.. import dmap``.
+	Thanks mikedizon
+
+0.6.0 [2009-08-07 06:54 A.M CET]
 --------------------------------
 
 **IMPORTANT CHANGES**
@@ -34,7 +165,7 @@ Change history
 	in the code for a long time)
 
 * New settings variable: ``CELERY_TASK_RESULT_EXPIRES``
-	Time (in seconds, or a :class:`datetime.timedelta` object) for when after
+	Time (in seconds, or a `datetime.timedelta` object) for when after
 	stored task results are deleted. For the moment this only works for the
 	database backend.
 
@@ -42,7 +173,8 @@ Change history
 	has been launched.
 
 * The periodic task table is now locked for reading while getting
-	periodic task status.
+	periodic task status. (MySQL only so far, seeking patches for other
+	engines)
 
 * A lot more debugging information is now available by turning on the
 	``DEBUG`` loglevel (``--loglevel=DEBUG``).

@@ -1,5 +1,5 @@
 """celery.conf"""
-from django.conf import settings
+from celery.loaders import settings
 from datetime import timedelta
 import logging
 
@@ -15,9 +15,14 @@ DEFAULT_DAEMON_LOG_LEVEL = "INFO"
 DEFAULT_DAEMON_LOG_FILE = "celeryd.log"
 DEFAULT_AMQP_CONNECTION_TIMEOUT = 4
 DEFAULT_STATISTICS = False
-DEFAULT_STATISTICS_COLLECT_INTERVAL = 60 * 5
 DEFAULT_ALWAYS_EAGER = False
 DEFAULT_TASK_RESULT_EXPIRES = timedelta(days=5)
+DEFAULT_AMQP_CONNECTION_RETRY = True
+DEFAULT_AMQP_CONNECTION_MAX_RETRIES = 100
+DEFAULT_TASK_SERIALIZER = "pickle"
+DEFAULT_BACKEND = "database"
+DEFAULT_PERIODIC_STATUS_BACKEND = "database"
+
 
 """
 .. data:: LOG_LEVELS
@@ -39,7 +44,6 @@ LOG_LEVELS = {
 .. data:: LOG_FORMAT
 
     The format to use for log messages.
-    Default is ``[%(asctime)s: %(levelname)s/%(processName)s] %(message)s``
 
 """
 LOG_FORMAT = getattr(settings, "CELERYD_DAEMON_LOG_FORMAT",
@@ -48,7 +52,7 @@ LOG_FORMAT = getattr(settings, "CELERYD_DAEMON_LOG_FORMAT",
 """
 .. data:: DAEMON_LOG_FILE
 
-    The path to the deamon log file (if not set, ``stderr`` is used).
+    Filename of the daemon log file.
 
 """
 DAEMON_LOG_FILE = getattr(settings, "CELERYD_LOG_FILE",
@@ -57,9 +61,6 @@ DAEMON_LOG_FILE = getattr(settings, "CELERYD_LOG_FILE",
 """
 .. data:: DAEMON_LOG_LEVEL
 
-    Celery daemon log level, can be any of ``DEBUG``, ``INFO``, ``WARNING``,
-    ``ERROR``, ``CRITICAL``, or ``FATAL``. See the :mod:`logging` module
-    for more information.
 
 """
 DAEMON_LOG_LEVEL = LOG_LEVELS[getattr(settings, "CELERYD_DAEMON_LOG_LEVEL",
@@ -77,7 +78,7 @@ DAEMON_PID_FILE = getattr(settings, "CELERYD_PID_FILE",
 """
 .. data:: DAEMON_CONCURRENCY
 
-    The number of concurrent worker processes, executing tasks simultaneously.
+    The number of concurrent worker processes.
 
 """
 DAEMON_CONCURRENCY = getattr(settings, "CELERYD_CONCURRENCY",
@@ -96,12 +97,7 @@ AMQP_EXCHANGE = getattr(settings, "CELERY_AMQP_EXCHANGE",
 """
 .. data:: AMQP_EXCHANGE_TYPE
 
-The type of exchange. If the exchange type is ``direct``, all messages
-receives all tasks. However, if the exchange type is ``topic``, you can
-route e.g. some tasks to one server, and others to the rest.
-See `Exchange types and the effect of bindings`_.
-
-.. _`Exchange types and the effect of bindings`: http://bit.ly/wpamqpexchanges
+The exchange type.
 
 """
 AMQP_EXCHANGE_TYPE = getattr(settings, "CELERY_AMQP_EXCHANGE_TYPE",
@@ -136,6 +132,24 @@ AMQP_CONSUMER_ROUTING_KEY = getattr(settings,
 AMQP_CONSUMER_QUEUE = getattr(settings, "CELERY_AMQP_CONSUMER_QUEUE",
                               DEFAULT_AMQP_CONSUMER_QUEUE)
 
+
+"""
+.. data:: AMQP_CONSUMER_QUEUES
+
+    Dictionary defining multiple AMQP queues.
+
+"""
+DEFAULT_AMQP_CONSUMER_QUEUES = {
+        AMQP_CONSUMER_QUEUE: {
+            "exchange": AMQP_EXCHANGE,
+            "routing_key": AMQP_CONSUMER_ROUTING_KEY,
+            "exchange_type": AMQP_EXCHANGE_TYPE,
+        }
+}
+
+AMQP_CONSUMER_QUEUES = getattr(settings, "CELERY_AMQP_CONSUMER_QUEUES",
+                              DEFAULT_AMQP_CONSUMER_QUEUES)
+
 """
 .. data:: AMQP_CONNECTION_TIMEOUT
 
@@ -158,23 +172,9 @@ SEND_CELERY_TASK_ERROR_EMAILS = getattr(settings,
                                         not settings.DEBUG)
 
 """
-.. data:: STATISTICS_COLLECT_INTERVAL
-
-    The interval in seconds of which the
-    :class:`celery.task.CollectStatisticsTask`` is run.
-
-"""
-STATISTICS_COLLECT_INTERVAL = getattr(settings,
-                                "CELERY_STATISTICS_COLLECT_INTERVAL",
-                                DEFAULT_STATISTICS_COLLECT_INTERVAL)
-
-"""
 .. data:: ALWAYS_EAGER
 
-    If this is ``True``, all tasks will be executed locally by blocking
-    until it is finished. ``apply_async`` and ``delay_task`` will return
-    a :class:`celery.result.EagerResult` which emulates the behaviour of
-    an :class:`celery.result.AsyncResult`.
+    Always execute tasks locally, don't send to the queue.
 
 """
 ALWAYS_EAGER = getattr(settings, "CELERY_ALWAYS_EAGER",
@@ -183,9 +183,8 @@ ALWAYS_EAGER = getattr(settings, "CELERY_ALWAYS_EAGER",
 """
 .. data: TASK_RESULT_EXPIRES
 
-    Time (in seconds, or a :class:`datetime.timedelta` object) for when after
-    stored task results are deleted. For the moment this only works for the
-    database backend.
+    Task tombstone expire time in seconds.
+
 """
 TASK_RESULT_EXPIRES = getattr(settings, "CELERY_TASK_RESULT_EXPIRES",
                               DEFAULT_TASK_RESULT_EXPIRES)
@@ -193,3 +192,75 @@ TASK_RESULT_EXPIRES = getattr(settings, "CELERY_TASK_RESULT_EXPIRES",
 # Make sure TASK_RESULT_EXPIRES is a timedelta.
 if isinstance(TASK_RESULT_EXPIRES, int):
     TASK_RESULT_EXPIRES = timedelta(seconds=TASK_RESULT_EXPIRES)
+
+"""
+.. data:: AMQP_CONNECTION_RETRY
+
+Automatically try to re-establish the connection to the AMQP broker if
+it's lost.
+
+"""
+AMQP_CONNECTION_RETRY = getattr(settings, "CELERY_AMQP_CONNECTION_RETRY",
+                                DEFAULT_AMQP_CONNECTION_RETRY)
+
+"""
+.. data:: AMQP_CONNECTION_MAX_RETRIES
+
+Maximum number of retries before we give up re-establishing a connection
+to the AMQP broker.
+
+If this is set to ``0`` or ``None``, we will retry forever.
+
+Default is ``100`` retries.
+
+"""
+AMQP_CONNECTION_MAX_RETRIES = getattr(settings,
+                                      "CELERY_AMQP_CONNECTION_MAX_RETRIES",
+                                      DEFAULT_AMQP_CONNECTION_MAX_RETRIES)
+
+"""
+.. data:: TASK_SERIALIZER
+
+A string identifying the default serialization
+method to use. Can be ``pickle`` (default),
+``json``, ``yaml``, or any custom serialization methods that have
+been registered with :mod:`carrot.serialization.registry`.
+
+Default is ``pickle``.
+
+"""
+TASK_SERIALIZER = getattr(settings, "CELERY_TASK_SERIALIZER",
+                          DEFAULT_TASK_SERIALIZER)
+
+
+"""
+
+.. data:: CELERY_BACKEND
+
+The backend used to store task results (tombstones).
+
+"""
+CELERY_BACKEND = getattr(settings, "CELERY_BACKEND", DEFAULT_BACKEND)
+
+
+"""
+
+.. data:: CELERY_PERIODIC_STATUS_BACKEND
+
+The backend used to store the status of periodic tasks.
+
+"""
+CELERY_PERIODIC_STATUS_BACKEND = getattr(settings,
+                                    "CELERY_PERIODIC_STATUS_BACKEND",
+                                    DEFAULT_PERIODIC_STATUS_BACKEND)
+
+
+"""
+
+.. data:: CELERY_CACHE_BACKEND
+
+Use a custom cache backend for celery. If not set the django-global
+cache backend in ``CACHE_BACKEND`` will be used.
+
+"""
+CELERY_CACHE_BACKEND = getattr(settings, "CELERY_CACHE_BACKEND", None)

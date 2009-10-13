@@ -13,8 +13,15 @@
     celery.result
     celery.task
     celery.registry
+    celery.signals
+    celery.exceptions
+    celery.task.rest
     celery.task.builtins
     celery.task.strategy
+    celery.loaders
+    celery.loaders.base
+    celery.loaders.default
+    celery.loaders.djangoapp
     celery.discovery
     celery.monitoring
     celery.messaging
@@ -27,6 +34,8 @@
     celery.backends.base
     celery.backends.database
     celery.backends.cache
+    celery.backends.amqp
+    celery.backends.mongodb
     celery.backends.tyrant
     celery.conf
     celery.datastructures
@@ -37,3 +46,4 @@
     celery.models
     celery.fields
     celery.bin.celeryd
+    celery.bin.celeryinit

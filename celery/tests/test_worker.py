@@ -1,6 +1,6 @@
 import unittest
 from Queue import Queue, Empty
-from carrot.connection import AMQPConnection
+from carrot.connection import BrokerConnection
 from celery.messaging import TaskConsumer
 from celery.worker.job import TaskWrapper
 from celery.worker import AMQPListener, WorkController
@@ -92,18 +92,14 @@ class TestAMQPListener(unittest.TestCase):
         l = AMQPListener(self.bucket_queue, self.hold_queue, self.logger)
 
         c = l.reset_connection()
-        self.assertTrue(isinstance(c, TaskConsumer))
-        self.assertTrue(c is l.task_consumer)
-        self.assertTrue(isinstance(l.amqp_connection, AMQPConnection))
+        self.assertTrue(isinstance(l.amqp_connection, BrokerConnection))
 
         l.close_connection()
         self.assertTrue(l.amqp_connection is None)
         self.assertTrue(l.task_consumer is None)
 
         c = l.reset_connection()
-        self.assertTrue(isinstance(c, TaskConsumer))
-        self.assertTrue(c is l.task_consumer)
-        self.assertTrue(isinstance(l.amqp_connection, AMQPConnection))
+        self.assertTrue(isinstance(l.amqp_connection, BrokerConnection))
 
         l.stop()
         self.assertTrue(l.amqp_connection is None)
@@ -140,10 +136,11 @@ class TestAMQPListener(unittest.TestCase):
         l.receive_message(m.decode(), m)
 
         in_hold = self.hold_queue.get_nowait()
-        self.assertEquals(len(in_hold), 2)
-        task, eta = in_hold
+        self.assertEquals(len(in_hold), 3)
+        task, eta, on_accept = in_hold
         self.assertTrue(isinstance(task, TaskWrapper))
         self.assertTrue(isinstance(eta, datetime))
+        self.assertTrue(callable(on_accept))
         self.assertEquals(task.task_name, "c.u.foo")
         self.assertEquals(task.execute(), 2 * 4 * 8)
         self.assertRaises(Empty, self.bucket_queue.get_nowait)

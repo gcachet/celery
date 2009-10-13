@@ -3,16 +3,13 @@
 Jobs Executable by the Worker Server.
 
 """
-from celery.registry import tasks, NotRegistered
-from celery.datastructures import ExceptionInfo
-from celery.backends import default_backend
+from celery.registry import tasks
+from celery.exceptions import NotRegistered
+from celery.execute import ExecuteWrapper
+from celery.utils import noop, fun_takes_kwargs
+from celery.log import get_default_logger
 from django.core.mail import mail_admins
-from celery.monitoring import TaskTimerStats
-import multiprocessing
-import traceback
 import socket
-import sys
-
 
 # pep8.py borks on a inline signature separator and
 # says "trailing whitespace" ;)
@@ -21,85 +18,26 @@ TASK_FAIL_EMAIL_BODY = """
 Task %%(name)s with id %%(id)s raised exception: %%(exc)s
 
 
-Task was called with args:%%(args)s kwargs:%%(kwargs)s.
+Task was called with args: %%(args)s kwargs: %%(kwargs)s.
+
 The contents of the full traceback was:
 
 %%(traceback)s
 
 %(EMAIL_SIGNATURE_SEP)s
-Just thought I'd let you know!
+Just to let you know,
 celeryd at %%(hostname)s.
 """ % {"EMAIL_SIGNATURE_SEP": EMAIL_SIGNATURE_SEP}
 
 
-def jail(task_id, task_name, func, args, kwargs):
-    """Wraps the task in a jail, which catches all exceptions, and
-    saves the status and result of the task execution to the task
-    meta backend.
-
-    If the call was successful, it saves the result to the task result
-    backend, and sets the task status to ``"DONE"``.
-
-    If the call results in an exception, it saves the exception as the task
-    result, and sets the task status to ``"FAILURE"``.
-
-    :param task_id: The id of the task.
-    :param task_name: The name of the task.
-    :param func: Callable object to execute.
-    :param args: List of positional args to pass on to the function.
-    :param kwargs: Keyword arguments mapping to pass on to the function.
-
-    :returns: the function return value on success, or
-        the exception instance on failure.
-
-    """
-    ignore_result = getattr(func, "ignore_result", False)
-    timer_stat = TaskTimerStats.start(task_id, task_name, args, kwargs)
-
-    # See: http://groups.google.com/group/django-users/browse_thread/
-    #       thread/78200863d0c07c6d/38402e76cf3233e8?hl=en&lnk=gst&
-    #       q=multiprocessing#38402e76cf3233e8
-    from django.db import connection
-    connection.close()
-
-    # Reset cache connection only if using memcached/libmemcached
-    from django.core import cache
-    # XXX At Opera we use a custom memcached backend that uses libmemcached
-    # instead of libmemcache (cmemcache). Should find a better solution for
-    # this, but for now "memcached" should probably be unique enough of a
-    # string to not make problems.
-    cache_backend = cache.settings.CACHE_BACKEND
-    if hasattr(cache, "parse_backend_uri"):
-        cache_scheme = cache.parse_backend_uri(cache_backend)[0]
-    else:
-        # Django <= 1.0.2
-        cache_scheme = cache_backend.split(":", 1)[0]
-    if "memcached" in cache_scheme:
-        cache.cache.close()
-
-    # Backend process cleanup
-    default_backend.process_cleanup()
-
-    try:
-        result = func(*args, **kwargs)
-    except (SystemExit, KeyboardInterrupt):
-        raise
-    except Exception, exc:
-        stored_exc = default_backend.mark_as_failure(task_id, exc)
-        type_, _, tb = sys.exc_info()
-        retval = ExceptionInfo((type_, stored_exc, tb))
-    else:
-        if not ignore_result:
-            default_backend.mark_as_done(task_id, result)
-        retval = result
-    finally:
-        timer_stat.stop()
-
-    return retval
+class AlreadyExecutedError(Exception):
+    """Tasks can only be executed once, as they might change
+    world-wide state."""
 
 
 class TaskWrapper(object):
-    """Class wrapping a task to be run.
+    """Class wrapping a task to be passed around and finally
+    executed inside of the worker.
 
     :param task_name: see :attr:`task_name`.
 
@@ -135,6 +73,11 @@ class TaskWrapper(object):
 
         The original message sent. Used for acknowledging the message.
 
+    .. attribute executed
+
+    Set if the task has been executed. A task should only be executed
+    once.
+
     """
     success_msg = "Task %(name)s[%(id)s] processed: %(return_value)s"
     fail_msg = """
@@ -146,19 +89,21 @@ class TaskWrapper(object):
     fail_email_body = TASK_FAIL_EMAIL_BODY
 
     def __init__(self, task_name, task_id, task_func, args, kwargs,
-            on_ack=None, **opts):
+            on_ack=noop, retries=0, **opts):
         self.task_name = task_name
         self.task_id = task_id
         self.task_func = task_func
+        self.retries = retries
         self.args = args
         self.kwargs = kwargs
         self.logger = kwargs.get("logger")
         self.on_ack = on_ack
+        self.executed = False
         for opt in ("success_msg", "fail_msg", "fail_email_subject",
                 "fail_email_body"):
             setattr(self, opt, opts.get(opt, getattr(self, opt, None)))
         if not self.logger:
-            self.logger = multiprocessing.get_logger()
+            self.logger = get_default_logger()
 
     def __repr__(self):
         return '<%s: {name:"%s", id:"%s", args:"%s", kwargs:"%s"}>' % (
@@ -181,6 +126,7 @@ class TaskWrapper(object):
         task_id = message_data["id"]
         args = message_data["args"]
         kwargs = message_data["kwargs"]
+        retries = message_data.get("retries", 0)
 
         # Convert any unicode keys in the keyword arguments to ascii.
         kwargs = dict((key.encode("utf-8"), value)
@@ -190,72 +136,59 @@ class TaskWrapper(object):
             raise NotRegistered(task_name)
         task_func = tasks[task_name]
         return cls(task_name, task_id, task_func, args, kwargs,
-                    on_ack=message.ack, logger=logger)
+                    retries=retries, on_ack=message.ack, logger=logger)
 
     def extend_with_default_kwargs(self, loglevel, logfile):
         """Extend the tasks keyword arguments with standard task arguments.
 
-        These are ``logfile``, ``loglevel``, ``task_id`` and ``task_name``.
+        Currently these are ``logfile``, ``loglevel``, ``task_id``,
+        ``task_name`` and ``task_retries``.
+
+        See :meth:`celery.task.base.Task.run` for more information.
 
         """
-        task_func_kwargs = {"logfile": logfile,
+        kwargs = dict(self.kwargs)
+        default_kwargs = {"logfile": logfile,
                             "loglevel": loglevel,
                             "task_id": self.task_id,
-                            "task_name": self.task_name}
-        task_func_kwargs.update(self.kwargs)
-        return task_func_kwargs
+                            "task_name": self.task_name,
+                            "task_retries": self.retries}
+        fun = getattr(self.task_func, "run", self.task_func)
+        supported_keys = fun_takes_kwargs(fun, default_kwargs)
+        extend_with = dict((key, val) for key, val in default_kwargs.items()
+                                if key in supported_keys)
+        kwargs.update(extend_with)
+        return kwargs
+
+    def _executeable(self, loglevel=None, logfile=None):
+        """Get the :class:`celery.execute.ExecuteWrapper` for this task."""
+        task_func_kwargs = self.extend_with_default_kwargs(loglevel, logfile)
+        return ExecuteWrapper(self.task_func, self.task_id, self.task_name,
+                              self.args, task_func_kwargs)
+
+    def _set_executed_bit(self):
+        """Set task as executed to make sure it's not executed again."""
+        if self.executed:
+            raise AlreadyExecutedError(
+                   "Task %s[%s] has already been executed" % (
+                       self.task_name, self.task_id))
+        self.executed = True
 
     def execute(self, loglevel=None, logfile=None):
-        """Execute the task in a :func:`jail` and store return value
-        and status in the task meta backend.
+        """Execute the task in a :class:`celery.execute.ExecuteWrapper`.
 
         :keyword loglevel: The loglevel used by the task.
 
         :keyword logfile: The logfile used by the task.
 
         """
-        task_func_kwargs = self.extend_with_default_kwargs(loglevel, logfile)
+        # Make sure task has not already been executed.
+        self._set_executed_bit()
+
         # acknowledge task as being processed.
-        if self.on_ack:
-            self.on_ack()
-        return jail(self.task_id, self.task_name, self.task_func,
-                    self.args, task_func_kwargs)
+        self.on_ack()
 
-    def on_success(self, ret_value, meta):
-        """The handler used if the task was successfully processed (
-        without raising an exception)."""
-        task_id = meta.get("task_id")
-        task_name = meta.get("task_name")
-        msg = self.success_msg.strip() % {
-                "id": task_id,
-                "name": task_name,
-                "return_value": ret_value}
-        self.logger.info(msg)
-
-    def on_failure(self, exc_info, meta):
-        """The handler used if the task raised an exception."""
-        from celery.conf import SEND_CELERY_TASK_ERROR_EMAILS
-
-        task_id = meta.get("task_id")
-        task_name = meta.get("task_name")
-        context = {
-            "hostname": socket.gethostname(),
-            "id": task_id,
-            "name": task_name,
-            "exc": exc_info.exception,
-            "traceback": exc_info.traceback,
-            "args": self.args,
-            "kwargs": self.kwargs,
-        }
-        self.logger.error(self.fail_msg.strip() % context)
-
-        task_obj = tasks.get(task_name, object)
-        send_error_email = SEND_CELERY_TASK_ERROR_EMAILS and not \
-                getattr(task_obj, "disable_error_emails", False)
-        if send_error_email:
-            subject = self.fail_email_subject.strip() % context
-            body = self.fail_email_body.strip() % context
-            mail_admins(subject, body, fail_silently=True)
+        return self._executeable(loglevel, logfile)()
 
     def execute_using_pool(self, pool, loglevel=None, logfile=None):
         """Like :meth:`execute`, but using the :mod:`multiprocessing` pool.
@@ -269,10 +202,42 @@ class TaskWrapper(object):
         :returns :class:`multiprocessing.AsyncResult` instance.
 
         """
-        task_func_kwargs = self.extend_with_default_kwargs(loglevel, logfile)
-        jail_args = [self.task_id, self.task_name, self.task_func,
-                     self.args, task_func_kwargs]
-        return pool.apply_async(jail, args=jail_args,
+        # Make sure task has not already been executed.
+        self._set_executed_bit()
+
+        wrapper = self._executeable(loglevel, logfile)
+        return pool.apply_async(wrapper,
                 callbacks=[self.on_success], errbacks=[self.on_failure],
-                on_ack=self.on_ack,
-                meta={"task_id": self.task_id, "task_name": self.task_name})
+                on_ack=self.on_ack)
+
+    def on_success(self, ret_value):
+        """The handler used if the task was successfully processed (
+        without raising an exception)."""
+        msg = self.success_msg.strip() % {
+                "id": self.task_id,
+                "name": self.task_name,
+                "return_value": ret_value}
+        self.logger.info(msg)
+
+    def on_failure(self, exc_info):
+        """The handler used if the task raised an exception."""
+        from celery.conf import SEND_CELERY_TASK_ERROR_EMAILS
+
+        context = {
+            "hostname": socket.gethostname(),
+            "id": self.task_id,
+            "name": self.task_name,
+            "exc": exc_info.exception,
+            "traceback": exc_info.traceback,
+            "args": self.args,
+            "kwargs": self.kwargs,
+        }
+        self.logger.error(self.fail_msg.strip() % context)
+
+        task_obj = tasks.get(self.task_name, object)
+        send_error_email = SEND_CELERY_TASK_ERROR_EMAILS and not \
+                getattr(task_obj, "disable_error_emails", False)
+        if send_error_email:
+            subject = self.fail_email_subject.strip() % context
+            body = self.fail_email_body.strip() % context
+            mail_admins(subject, body, fail_silently=True)

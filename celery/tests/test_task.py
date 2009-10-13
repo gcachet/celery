@@ -39,6 +39,84 @@ class RaisingTask(task.Task):
         raise KeyError("foo")
 
 
+class RetryTask(task.Task):
+    max_retries = 3
+    iterations = 0
+
+    def run(self, arg1, arg2, kwarg=1, **kwargs):
+        self.__class__.iterations += 1
+
+        retries = kwargs["task_retries"]
+        if retries >= 3:
+            return arg1
+        else:
+            kwargs.update({"kwarg": kwarg})
+            return self.retry(args=[arg1, arg2], kwargs=kwargs, countdown=0)
+
+
+class MyCustomException(Exception):
+    """Random custom exception."""
+
+
+class RetryTaskCustomExc(task.Task):
+    max_retries = 3
+    iterations = 0
+
+    def run(self, arg1, arg2, kwarg=1, **kwargs):
+        self.__class__.iterations += 1
+
+        retries = kwargs["task_retries"]
+        if retries >= 3:
+            return arg1 + kwarg
+        else:
+            try:
+                raise MyCustomException("Elaine Marie Benes")
+            except MyCustomException, exc:
+                kwargs.update({"kwarg": kwarg})
+                return self.retry(args=[arg1, arg2], kwargs=kwargs,
+                                  countdown=0, exc=exc)
+
+
+class TestTaskRetries(unittest.TestCase):
+
+    def test_retry(self):
+        RetryTask.max_retries = 3
+        RetryTask.iterations = 0
+        result = RetryTask.apply([0xFF, 0xFFFF])
+        self.assertEquals(result.get(), 0xFF)
+        self.assertEquals(RetryTask.iterations, 4)
+
+    def test_retry_with_kwargs(self):
+        RetryTaskCustomExc.max_retries = 3
+        RetryTaskCustomExc.iterations = 0
+        result = RetryTaskCustomExc.apply([0xFF, 0xFFFF], {"kwarg": 0xF})
+        self.assertEquals(result.get(), 0xFF + 0xF)
+        self.assertEquals(RetryTaskCustomExc.iterations, 4)
+
+    def test_retry_with_custom_exception(self):
+        RetryTaskCustomExc.max_retries = 2
+        RetryTaskCustomExc.iterations = 0
+        result = RetryTaskCustomExc.apply([0xFF, 0xFFFF], {"kwarg": 0xF})
+        self.assertRaises(MyCustomException,
+                          result.get)
+        self.assertEquals(RetryTaskCustomExc.iterations, 3)
+
+    def test_max_retries_exceeded(self):
+        RetryTask.max_retries = 2
+        RetryTask.iterations = 0
+        result = RetryTask.apply([0xFF, 0xFFFF])
+        self.assertRaises(RetryTask.MaxRetriesExceededError,
+                          result.get)
+        self.assertEquals(RetryTask.iterations, 3)
+
+        RetryTask.max_retries = 1
+        RetryTask.iterations = 0
+        result = RetryTask.apply([0xFF, 0xFFFF])
+        self.assertRaises(RetryTask.MaxRetriesExceededError,
+                          result.get)
+        self.assertEquals(RetryTask.iterations, 2)
+
+
 class TestCeleryTasks(unittest.TestCase):
 
     def createTaskCls(self, cls_name, task_name=None):
@@ -195,11 +273,12 @@ class TestTaskSet(unittest.TestCase):
         self.assertEquals(ts.task_name, IncrementCounterTask.name)
         self.assertEquals(ts.total, 9)
 
+
+        consumer = IncrementCounterTask().get_consumer()
+        consumer.discard_all()
         taskset_res = ts.run()
         subtasks = taskset_res.subtasks
         taskset_id = taskset_res.taskset_id
-
-        consumer = IncrementCounterTask().get_consumer()
         for subtask in subtasks:
             m = consumer.decoder(consumer.fetch().body)
             self.assertEquals(m.get("taskset"), taskset_id)
@@ -232,6 +311,7 @@ class TestTaskApply(unittest.TestCase):
         f = RaisingTask.apply()
         self.assertTrue(f.is_ready())
         self.assertFalse(f.is_done())
+        self.assertTrue(f.traceback)
         self.assertRaises(KeyError, f.get)
 
 

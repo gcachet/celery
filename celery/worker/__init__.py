@@ -2,20 +2,22 @@
 
 The Multiprocessing Worker Server
 
-Documentation for this module is in ``docs/reference/celery.worker.rst``.
-
 """
-from carrot.connection import DjangoAMQPConnection
+from carrot.connection import DjangoBrokerConnection, AMQPConnectionException
 from celery.worker.controllers import Mediator, PeriodicWorkController
 from celery.worker.job import TaskWrapper
-from celery.registry import NotRegistered
-from celery.messaging import TaskConsumer
+from celery.exceptions import NotRegistered
+from celery.messaging import get_consumer_set
 from celery.conf import DAEMON_CONCURRENCY, DAEMON_LOG_FILE
+from celery.conf import AMQP_CONNECTION_RETRY, AMQP_CONNECTION_MAX_RETRIES
 from celery.log import setup_logger
 from celery.pool import TaskPool
+from celery.utils import retry_over_time
+from celery.datastructures import SharedCounter
 from Queue import Queue
 import traceback
 import logging
+import socket
 
 
 class AMQPListener(object):
@@ -40,16 +42,34 @@ class AMQPListener(object):
 
     """
 
-    def __init__(self, bucket_queue, hold_queue, logger):
+    def __init__(self, bucket_queue, hold_queue, logger,
+            initial_prefetch_count=2):
         self.amqp_connection = None
         self.task_consumer = None
         self.bucket_queue = bucket_queue
         self.hold_queue = hold_queue
         self.logger = logger
+        self.prefetch_count = SharedCounter(initial_prefetch_count)
 
     def start(self):
-        """Start processing AMQP messages."""
-        task_consumer = self.reset_connection()
+        """Start the consumer.
+
+        If the connection is lost, it tries to re-establish the connection
+        over time and restart consuming messages.
+
+        """
+
+        while True:
+            self.reset_connection()
+            try:
+                self.consume_messages()
+            except (socket.error, AMQPConnectionException, IOError):
+                self.logger.error("AMQPListener: Connection to broker lost. "
+                                + "Trying to re-establish connection...")
+
+    def consume_messages(self):
+        """Consume messages forever (or until an exception is raised)."""
+        task_consumer = self.task_consumer
 
         self.logger.debug("AMQPListener: Starting message consumer...")
         it = task_consumer.iterconsume(limit=None)
@@ -57,6 +77,7 @@ class AMQPListener(object):
         self.logger.debug("AMQPListener: Ready to accept tasks!")
 
         while True:
+            self.task_consumer.qos(prefetch_count=int(self.prefetch_count))
             it.next()
 
     def stop(self):
@@ -80,9 +101,10 @@ class AMQPListener(object):
 
         eta = message_data.get("eta")
         if eta:
+            self.prefetch_count.increment()
             self.logger.info("Got task from broker: %s[%s] eta:[%s]" % (
                     task.task_name, task.task_id, eta))
-            self.hold_queue.put((task, eta))
+            self.hold_queue.put((task, eta, self.prefetch_count.decrement))
         else:
             self.logger.info("Got task from broker: %s[%s]" % (
                     task.task_name, task.task_id))
@@ -101,7 +123,7 @@ class AMQPListener(object):
 
     def reset_connection(self):
         """Reset the AMQP connection, and reinitialize the
-        :class:`celery.messaging.TaskConsumer` instance.
+        :class:`carrot.messaging.ConsumerSet` instance.
 
         Resets the task consumer in :attr:`task_consumer`.
 
@@ -109,10 +131,36 @@ class AMQPListener(object):
         self.logger.debug(
                 "AMQPListener: Re-establishing connection to the broker...")
         self.close_connection()
-        self.amqp_connection = DjangoAMQPConnection()
-        self.task_consumer = TaskConsumer(connection=self.amqp_connection)
+        self.amqp_connection = self._open_connection()
+        self.task_consumer = get_consumer_set(connection=self.amqp_connection)
         self.task_consumer.register_callback(self.receive_message)
-        return self.task_consumer
+
+    def _open_connection(self):
+        """Retries connecting to the AMQP broker over time.
+
+        See :func:`celery.utils.retry_over_time`.
+
+        """
+
+        def _connection_error_handler(exc, interval):
+            """Callback handler for connection errors."""
+            self.logger.error("AMQP Listener: Connection Error: %s. " % exc
+                     + "Trying again in %d seconds..." % interval)
+
+        def _establish_connection():
+            """Establish a connection to the AMQP broker."""
+            conn = DjangoBrokerConnection()
+            connected = conn.connection # Connection is established lazily.
+            return conn
+
+        if not AMQP_CONNECTION_RETRY:
+            return _establish_connection()
+
+        conn = retry_over_time(_establish_connection, (socket.error, IOError),
+                               errback=_connection_error_handler,
+                               max_retries=AMQP_CONNECTION_MAX_RETRIES)
+        self.logger.debug("AMQPListener: Connection Established.")
+        return conn
 
 
 class WorkController(object):
@@ -200,7 +248,8 @@ class WorkController(object):
                                                     self.hold_queue)
         self.pool = TaskPool(self.concurrency, logger=self.logger)
         self.amqp_listener = AMQPListener(self.bucket_queue, self.hold_queue,
-                                          logger=self.logger)
+                                          logger=self.logger,
+                                          initial_prefetch_count=concurrency)
         self.mediator = Mediator(self.bucket_queue, self.safe_process_task)
 
         # The order is important here;
@@ -247,3 +296,5 @@ class WorkController(object):
             return
 
         [component.stop() for component in reversed(self.components)]
+
+        self._state = "STOP"
